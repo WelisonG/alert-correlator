@@ -1,4 +1,5 @@
 import unittest
+import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +118,102 @@ class TestStorage(unittest.TestCase):
 
         self.assertTrue(storage.save_correlation(result))
         self.assertFalse(storage.save_correlation(result))
+
+    def _criar_banco_antigo(self):
+        """Recria o arquivo temporário com o schema anterior ao ciclo de vida e um ticket."""
+        self.temp_path.unlink()
+        conn = sqlite3.connect(str(self.temp_path))
+        conn.execute("""
+            CREATE TABLE tickets (
+                id TEXT PRIMARY KEY,
+                ativo TEXT,
+                servico TEXT,
+                sintomas TEXT,
+                descricao TEXT,
+                timestamp TEXT,
+                criado_em TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "INSERT INTO tickets (id, ativo, servico, sintomas, descricao, timestamp, criado_em) "
+            "VALUES ('T001', 'APP-001', 'Payment', NULL, NULL, NULL, '2026-10-14T10:00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+    def test_migracao_banco_antigo_preserva_dados(self):
+        """Teste 7: Migrar banco sem colunas de ciclo de vida preservando os tickets."""
+        self._criar_banco_antigo()
+        storage.init_db()
+
+        retrieved = storage.get_ticket("T001")
+        self.assertEqual(retrieved.ativo, "APP-001")
+        self.assertEqual(retrieved.status, "aberto")
+        self.assertIsNone(retrieved.resolvido_em)
+        self.assertIsNone(retrieved.encerrado_em)
+
+    def test_migracao_idempotente(self):
+        """Teste 8: Executar a migração repetidamente não duplica colunas nem falha."""
+        self._criar_banco_antigo()
+        storage.init_db()
+        storage.init_db()
+
+        conn = sqlite3.connect(str(self.temp_path))
+        colunas = [row[1] for row in conn.execute("PRAGMA table_info(tickets)").fetchall()]
+        conn.close()
+        self.assertEqual(colunas.count("status"), 1)
+        self.assertEqual(len(colunas), len(set(colunas)))
+
+    def test_status_padrao_aberto(self):
+        """Teste 9: Ticket sem status recebe 'aberto' e datas vazias."""
+        storage.save_ticket(Ticket(id="T001"))
+
+        retrieved = storage.get_ticket("T001")
+        self.assertEqual(retrieved.status, "aberto")
+        self.assertIsNone(retrieved.resolvido_em)
+        self.assertIsNone(retrieved.encerrado_em)
+
+    def test_persistir_status_e_resolvido_em(self):
+        """Teste 10: Salvar e recuperar status e data compatíveis."""
+        t = Ticket(id="T001", status="resolvido", resolvido_em=datetime(2026, 10, 14, 12, 0, 0))
+        storage.save_ticket(t)
+
+        retrieved = storage.get_ticket("T001")
+        self.assertEqual(retrieved.status, "resolvido")
+        self.assertEqual(retrieved.resolvido_em, datetime(2026, 10, 14, 12, 0, 0))
+        self.assertIsNone(retrieved.encerrado_em)
+
+    def test_recusar_status_invalido(self):
+        """Teste 11: Recusar status fora da lista permitida, no modelo e na atualização."""
+        with self.assertRaises(ValueError):
+            Ticket(id="T001", status="novo")
+
+        storage.save_ticket(Ticket(id="T001"))
+        with self.assertRaises(ValueError):
+            storage.atualizar_status_ticket("T001", "novo")
+
+    def test_atualizar_status_ticket(self):
+        """Teste 12: Atualizar status de ticket existente e recusar ID inexistente."""
+        storage.save_ticket(Ticket(id="T001"))
+
+        self.assertTrue(storage.atualizar_status_ticket("T001", "em_andamento"))
+        self.assertEqual(storage.get_ticket("T001").status, "em_andamento")
+
+        self.assertFalse(storage.atualizar_status_ticket("T999", "resolvido"))
+
+    def test_encerrar_preserva_data_de_resolucao(self):
+        """Teste 13: Encerrar sem informar resolvido_em mantém a data de resolução já gravada."""
+        storage.save_ticket(Ticket(id="T001"))
+        resolvido = datetime(2026, 10, 14, 12, 0, 0)
+        encerrado = datetime(2026, 10, 15, 9, 0, 0)
+
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=resolvido)
+        storage.atualizar_status_ticket("T001", "encerrado", encerrado_em=encerrado)
+
+        retrieved = storage.get_ticket("T001")
+        self.assertEqual(retrieved.status, "encerrado")
+        self.assertEqual(retrieved.resolvido_em, resolvido)
+        self.assertEqual(retrieved.encerrado_em, encerrado)
 
 
 if __name__ == "__main__":

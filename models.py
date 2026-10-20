@@ -3,6 +3,15 @@ from datetime import datetime
 from typing import Optional
 
 
+STATUS_VALIDOS = ("aberto", "em_andamento", "resolvido", "encerrado")
+
+
+def validar_status(status: str) -> None:
+    """Levanta ValueError se o status não for um dos valores permitidos."""
+    if status not in STATUS_VALIDOS:
+        raise ValueError(f"Status inválido: {status}")
+
+
 @dataclass
 class Ticket:
     """Chamado/alerta com informações de contexto."""
@@ -12,6 +21,12 @@ class Ticket:
     sintomas: Optional[list[str]] = field(default_factory=lambda: None)
     descrição: Optional[str] = None
     timestamp: Optional[datetime] = None
+    status: str = "aberto"
+    resolvido_em: Optional[datetime] = None
+    encerrado_em: Optional[datetime] = None
+
+    def __post_init__(self):
+        validar_status(self.status)
 
 
 @dataclass

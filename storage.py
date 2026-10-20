@@ -2,7 +2,7 @@ import sqlite3
 import json
 from datetime import datetime
 from pathlib import Path
-from models import Ticket, CorrelationResult, CorrelationReason
+from models import Ticket, CorrelationResult, CorrelationReason, validar_status
 
 
 def _db_path():
@@ -15,6 +15,24 @@ def _get_connection():
     conn = sqlite3.connect(str(_db_path()))
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+COLUNAS_CICLO_VIDA = {
+    "status": "TEXT NOT NULL DEFAULT 'aberto'",
+    "resolvido_em": "TEXT",
+    "encerrado_em": "TEXT",
+}
+
+COLUNAS_TICKET = "id, ativo, servico, sintomas, descricao, timestamp, status, resolvido_em, encerrado_em"
+
+
+def _migrar_tickets(cursor):
+    """Adiciona colunas do ciclo de vida em bancos antigos. Idempotente e sem apagar dados."""
+    cursor.execute("PRAGMA table_info(tickets)")
+    existentes = {row[1] for row in cursor.fetchall()}
+    for nome, definicao in COLUNAS_CICLO_VIDA.items():
+        if nome not in existentes:
+            cursor.execute(f"ALTER TABLE tickets ADD COLUMN {nome} {definicao}")
 
 
 def init_db():
@@ -33,6 +51,8 @@ def init_db():
             criado_em TEXT NOT NULL
         )
     """)
+
+    _migrar_tickets(cursor)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS correlations (
@@ -62,12 +82,15 @@ def save_ticket(ticket: Ticket) -> bool:
     try:
         sintomas_json = json.dumps(ticket.sintomas) if ticket.sintomas is not None else None
         timestamp_iso = ticket.timestamp.isoformat() if ticket.timestamp else None
+        resolvido_em_iso = ticket.resolvido_em.isoformat() if ticket.resolvido_em else None
+        encerrado_em_iso = ticket.encerrado_em.isoformat() if ticket.encerrado_em else None
         criado_em = datetime.utcnow().isoformat()
 
         cursor.execute("""
-            INSERT INTO tickets (id, ativo, servico, sintomas, descricao, timestamp, criado_em)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (ticket.id, ticket.ativo, ticket.serviço, sintomas_json, ticket.descrição, timestamp_iso, criado_em))
+            INSERT INTO tickets (id, ativo, servico, sintomas, descricao, timestamp, criado_em, status, resolvido_em, encerrado_em)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ticket.id, ticket.ativo, ticket.serviço, sintomas_json, ticket.descrição, timestamp_iso, criado_em,
+              ticket.status, resolvido_em_iso, encerrado_em_iso))
 
         conn.commit()
         return True
@@ -77,29 +100,34 @@ def save_ticket(ticket: Ticket) -> bool:
         conn.close()
 
 
+def _linha_para_ticket(row) -> Ticket:
+    """Converte uma linha da tabela tickets (colunas de COLUNAS_TICKET) em Ticket."""
+    return Ticket(
+        id=row[0],
+        ativo=row[1],
+        serviço=row[2],
+        sintomas=json.loads(row[3]) if row[3] else None,
+        descrição=row[4],
+        timestamp=datetime.fromisoformat(row[5]) if row[5] else None,
+        status=row[6],
+        resolvido_em=datetime.fromisoformat(row[7]) if row[7] else None,
+        encerrado_em=datetime.fromisoformat(row[8]) if row[8] else None
+    )
+
+
 def get_ticket(id: str) -> Ticket | None:
     """Busca um chamado por ID."""
     conn = _get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, ativo, servico, sintomas, descricao, timestamp FROM tickets WHERE id = ?", (id,))
+    cursor.execute(f"SELECT {COLUNAS_TICKET} FROM tickets WHERE id = ?", (id,))
     row = cursor.fetchone()
     conn.close()
 
     if not row:
         return None
 
-    sintomas = json.loads(row[3]) if row[3] else None
-    timestamp = datetime.fromisoformat(row[5]) if row[5] else None
-
-    return Ticket(
-        id=row[0],
-        ativo=row[1],
-        serviço=row[2],
-        sintomas=sintomas,
-        descrição=row[4],
-        timestamp=timestamp
-    )
+    return _linha_para_ticket(row)
 
 
 def list_tickets() -> list[Ticket]:
@@ -107,24 +135,37 @@ def list_tickets() -> list[Ticket]:
     conn = _get_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, ativo, servico, sintomas, descricao, timestamp FROM tickets")
+    cursor.execute(f"SELECT {COLUNAS_TICKET} FROM tickets")
     rows = cursor.fetchall()
     conn.close()
 
-    tickets = []
-    for row in rows:
-        sintomas = json.loads(row[3]) if row[3] else None
-        timestamp = datetime.fromisoformat(row[5]) if row[5] else None
-        tickets.append(Ticket(
-            id=row[0],
-            ativo=row[1],
-            serviço=row[2],
-            sintomas=sintomas,
-            descrição=row[4],
-            timestamp=timestamp
-        ))
+    return [_linha_para_ticket(row) for row in rows]
 
-    return tickets
+
+def atualizar_status_ticket(id: str, status: str, resolvido_em: datetime | None = None,
+                            encerrado_em: datetime | None = None) -> bool:
+    """Atualiza o status de um chamado. Datas omitidas (None) preservam os valores existentes. Retorna False se o ID não existe."""
+    validar_status(status)
+    conn = _get_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+            UPDATE tickets
+            SET status = ?,
+                resolvido_em = COALESCE(?, resolvido_em),
+                encerrado_em = COALESCE(?, encerrado_em)
+            WHERE id = ?
+        """, (
+            status,
+            resolvido_em.isoformat() if resolvido_em else None,
+            encerrado_em.isoformat() if encerrado_em else None,
+            id
+        ))
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
 
 
 def save_correlation(result: CorrelationResult) -> bool:
