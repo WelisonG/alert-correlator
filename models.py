@@ -12,6 +12,20 @@ def validar_status(status: str) -> None:
         raise ValueError(f"Status inválido: {status}")
 
 
+TRANSICOES_VALIDAS = {
+    "aberto": ("em_andamento", "resolvido"),
+    "em_andamento": ("resolvido", "aberto"),
+    "resolvido": ("encerrado", "em_andamento"),
+    "encerrado": (),
+}
+
+
+def validar_transicao(atual: str, novo: str) -> None:
+    """Levanta ValueError se a mudança de status não for permitida."""
+    if novo not in TRANSICOES_VALIDAS[atual]:
+        raise ValueError(f"Transição inválida: {atual} -> {novo}")
+
+
 @dataclass
 class Ticket:
     """Chamado/alerta com informações de contexto."""

@@ -1,8 +1,8 @@
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from models import Ticket, CorrelationResult, CorrelationReason, validar_status
+from models import Ticket, CorrelationResult, CorrelationReason, validar_status, validar_transicao
 
 
 def _db_path():
@@ -70,8 +70,39 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id TEXT NOT NULL,
+            status_anterior TEXT,
+            status_novo TEXT NOT NULL,
+            resolvido_em TEXT,
+            encerrado_em TEXT,
+            evento_em TEXT NOT NULL,
+            FOREIGN KEY(ticket_id) REFERENCES tickets(id)
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+
+def _agora() -> datetime:
+    """Momento atual em UTC, com fuso horário. Usado somente para horários gerados automaticamente."""
+    return datetime.now(timezone.utc)
+
+
+def _registrar_evento(cursor, ticket_id, status_anterior, status_novo, resolvido_em_iso, encerrado_em_iso):
+    """Insere uma linha no histórico.
+
+    evento_em é o momento em que a mudança foi registrada; sempre é gerado aqui, em UTC.
+    resolvido_em e encerrado_em são os momentos efetivos da resolução e do encerramento, e podem ser informados pelo chamador.
+    Deve ser chamada dentro da transação de quem a chama.
+    """
+    cursor.execute("""
+        INSERT INTO ticket_historico (ticket_id, status_anterior, status_novo, resolvido_em, encerrado_em, evento_em)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (ticket_id, status_anterior, status_novo, resolvido_em_iso, encerrado_em_iso, _agora().isoformat()))
 
 
 def save_ticket(ticket: Ticket) -> bool:
@@ -91,11 +122,16 @@ def save_ticket(ticket: Ticket) -> bool:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (ticket.id, ticket.ativo, ticket.serviço, sintomas_json, ticket.descrição, timestamp_iso, criado_em,
               ticket.status, resolvido_em_iso, encerrado_em_iso))
+        _registrar_evento(cursor, ticket.id, None, ticket.status, resolvido_em_iso, encerrado_em_iso)
 
         conn.commit()
         return True
     except sqlite3.IntegrityError:
+        conn.rollback()
         return False
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -144,26 +180,48 @@ def list_tickets() -> list[Ticket]:
 
 def atualizar_status_ticket(id: str, status: str, resolvido_em: datetime | None = None,
                             encerrado_em: datetime | None = None) -> bool:
-    """Atualiza o status de um chamado. Datas omitidas (None) preservam os valores existentes. Retorna False se o ID não existe."""
+    """Muda o status e registra o evento no histórico, na mesma transação.
+
+    BEGIN IMMEDIATE obtém o bloqueio de escrita antes da leitura do status atual.
+    Reabertura (resolvido -> em_andamento) limpa resolvido_em do ticket; as resoluções anteriores permanecem no histórico.
+    Encerramento preserva a última resolução. Retorna False se o ID não existe.
+    """
     validar_status(status)
     conn = _get_connection()
     cursor = conn.cursor()
 
     try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT status, resolvido_em, encerrado_em FROM tickets WHERE id = ?", (id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        atual, resolvido_atual, encerrado_atual = row
+        validar_transicao(atual, status)
+
+        evento_resolvido = (resolvido_em or _agora()).isoformat() if status == "resolvido" else None
+        evento_encerrado = (encerrado_em or _agora()).isoformat() if status == "encerrado" else None
+
+        if status == "resolvido":
+            nova_resolucao = evento_resolvido
+        elif atual == "resolvido" and status == "em_andamento":
+            nova_resolucao = None
+        else:
+            nova_resolucao = resolvido_atual
+
+        novo_encerramento = evento_encerrado or encerrado_atual
+
         cursor.execute("""
-            UPDATE tickets
-            SET status = ?,
-                resolvido_em = COALESCE(?, resolvido_em),
-                encerrado_em = COALESCE(?, encerrado_em)
+            UPDATE tickets SET status = ?, resolvido_em = ?, encerrado_em = ?
             WHERE id = ?
-        """, (
-            status,
-            resolvido_em.isoformat() if resolvido_em else None,
-            encerrado_em.isoformat() if encerrado_em else None,
-            id
-        ))
+        """, (status, nova_resolucao, novo_encerramento, id))
+        _registrar_evento(cursor, id, atual, status, evento_resolvido, evento_encerrado)
         conn.commit()
-        return cursor.rowcount == 1
+        return True
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

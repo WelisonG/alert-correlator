@@ -1,7 +1,7 @@
 import unittest
 import sqlite3
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from models import Ticket, CorrelationResult, CorrelationReason
 import storage
@@ -214,6 +214,147 @@ class TestStorage(unittest.TestCase):
         self.assertEqual(retrieved.status, "encerrado")
         self.assertEqual(retrieved.resolvido_em, resolvido)
         self.assertEqual(retrieved.encerrado_em, encerrado)
+
+    def _historico(self, ticket_id):
+        """Retorna as linhas do histórico de um ticket, em ordem de inserção."""
+        conn = sqlite3.connect(str(self.temp_path))
+        rows = conn.execute(
+            "SELECT status_anterior, status_novo, resolvido_em, encerrado_em FROM ticket_historico WHERE ticket_id = ? ORDER BY id",
+            (ticket_id,)
+        ).fetchall()
+        conn.close()
+        return rows
+
+    def test_criacao_registra_evento_inicial(self):
+        """Teste 14: save_ticket grava a linha inicial do histórico."""
+        storage.save_ticket(Ticket(id="T001", status="em_andamento"))
+        self.assertEqual(self._historico("T001"), [(None, "em_andamento", None, None)])
+
+    def test_sequencia_valida_gera_um_evento_por_mudanca(self):
+        """Teste 15: aberto -> em_andamento -> resolvido -> encerrado gera uma linha por passo."""
+        storage.save_ticket(Ticket(id="T001"))
+        storage.atualizar_status_ticket("T001", "em_andamento")
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 14, 12, 0, 0))
+        storage.atualizar_status_ticket("T001", "encerrado", encerrado_em=datetime(2026, 10, 15, 9, 0, 0))
+
+        historico = self._historico("T001")
+        self.assertEqual([(a, n) for a, n, _, _ in historico], [
+            (None, "aberto"), ("aberto", "em_andamento"), ("em_andamento", "resolvido"), ("resolvido", "encerrado")
+        ])
+
+    def test_aberto_para_resolvido_direto(self):
+        """Teste 16: aberto -> resolvido é transição válida."""
+        storage.save_ticket(Ticket(id="T001"))
+        self.assertTrue(storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 14, 12, 0, 0)))
+        self.assertEqual(storage.get_ticket("T001").status, "resolvido")
+
+    def test_reabertura_limpa_resolucao_atual_e_preserva_historico(self):
+        """Teste 17: reabrir limpa resolvido_em; cada resolução fica no histórico com sua data."""
+        storage.save_ticket(Ticket(id="T001"))
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 14, 12, 0, 0))
+        storage.atualizar_status_ticket("T001", "em_andamento")
+
+        reaberto = storage.get_ticket("T001")
+        self.assertEqual(reaberto.status, "em_andamento")
+        self.assertIsNone(reaberto.resolvido_em)
+
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 16, 12, 0, 0))
+        self.assertEqual(storage.get_ticket("T001").resolvido_em, datetime(2026, 10, 16, 12, 0, 0))
+
+        datas = [resolvido for _, novo, resolvido, _ in self._historico("T001") if novo == "resolvido"]
+        self.assertEqual(datas, [
+            datetime(2026, 10, 14, 12, 0, 0).isoformat(),
+            datetime(2026, 10, 16, 12, 0, 0).isoformat(),
+        ])
+
+    def test_encerrar_preserva_ultima_resolucao(self):
+        """Teste 18: encerrar mantém a resolução atual e grava encerrado_em no evento."""
+        storage.save_ticket(Ticket(id="T001"))
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 16, 12, 0, 0))
+        storage.atualizar_status_ticket("T001", "encerrado", encerrado_em=datetime(2026, 10, 17, 9, 0, 0))
+
+        retrieved = storage.get_ticket("T001")
+        self.assertEqual(retrieved.resolvido_em, datetime(2026, 10, 16, 12, 0, 0))
+        self.assertEqual(retrieved.encerrado_em, datetime(2026, 10, 17, 9, 0, 0))
+        self.assertEqual(self._historico("T001")[-1][3], datetime(2026, 10, 17, 9, 0, 0).isoformat())
+
+    def test_evento_em_difere_de_resolvido_em(self):
+        """Teste 19: evento_em é o registro em UTC; resolvido_em é a data informada, sem conversão."""
+        storage.save_ticket(Ticket(id="T001"))
+        resolvido = datetime(2026, 10, 14, 12, 0, 0)
+        antes = datetime.now(timezone.utc)
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=resolvido)
+        depois = datetime.now(timezone.utc)
+
+        ticket_resolvido = storage.get_ticket("T001").resolvido_em
+        self.assertEqual(ticket_resolvido, resolvido)
+        self.assertIsNone(ticket_resolvido.tzinfo)
+
+        conn = sqlite3.connect(str(self.temp_path))
+        evento_em = conn.execute(
+            "SELECT evento_em FROM ticket_historico WHERE ticket_id = ? AND status_novo = 'resolvido'", ("T001",)
+        ).fetchone()[0]
+        conn.close()
+
+        evento = datetime.fromisoformat(evento_em)
+        self.assertIsNotNone(evento.tzinfo)
+        self.assertLessEqual(antes, evento)
+        self.assertLessEqual(evento, depois)
+
+    def test_resolucao_sem_data_usa_momento_utc(self):
+        """Teste 20: resolver sem informar resolvido_em grava o momento atual em UTC, com fuso."""
+        storage.save_ticket(Ticket(id="T001"))
+        storage.atualizar_status_ticket("T001", "resolvido")
+
+        resolvido = storage.get_ticket("T001").resolvido_em
+        self.assertIsNotNone(resolvido.tzinfo)
+        self.assertEqual(resolvido.utcoffset(), timedelta(0))
+        self.assertLess(abs(datetime.now(timezone.utc) - resolvido), timedelta(minutes=1))
+
+    def test_transicoes_invalidas_nao_alteram_ticket_nem_historico(self):
+        """Teste 21: encerrado é terminal; mesmo status é recusado."""
+        storage.save_ticket(Ticket(id="T001"))
+        storage.atualizar_status_ticket("T001", "resolvido", resolvido_em=datetime(2026, 10, 14, 12, 0, 0))
+        storage.atualizar_status_ticket("T001", "encerrado", encerrado_em=datetime(2026, 10, 15, 9, 0, 0))
+        historico_antes = len(self._historico("T001"))
+
+        for novo in ("em_andamento", "resolvido", "encerrado"):
+            with self.assertRaises(ValueError):
+                storage.atualizar_status_ticket("T001", novo)
+
+        storage.save_ticket(Ticket(id="T002"))
+        with self.assertRaises(ValueError):
+            storage.atualizar_status_ticket("T002", "aberto")
+
+        self.assertEqual(storage.get_ticket("T001").status, "encerrado")
+        self.assertEqual(len(self._historico("T001")), historico_antes)
+
+    def test_falha_no_historico_faz_rollback_do_ticket(self):
+        """Teste 22: se o histórico falhar, o status do ticket não muda."""
+        storage.save_ticket(Ticket(id="T001"))
+        conn = sqlite3.connect(str(self.temp_path))
+        conn.execute("""
+            CREATE TRIGGER falha_historico BEFORE INSERT ON ticket_historico
+            BEGIN SELECT RAISE(ABORT, 'falha simulada'); END
+        """)
+        conn.commit()
+        conn.close()
+
+        with self.assertRaises(sqlite3.DatabaseError):
+            storage.atualizar_status_ticket("T001", "em_andamento")
+
+        self.assertEqual(storage.get_ticket("T001").status, "aberto")
+        self.assertEqual(len(self._historico("T001")), 1)
+
+    def test_banco_antigo_nao_recebe_eventos_inventados(self):
+        """Teste 23: ticket legado não tem histórico após a migração; o primeiro evento é o da próxima mudança."""
+        self._criar_banco_antigo()
+        storage.init_db()
+        storage.init_db()
+
+        self.assertEqual(self._historico("T001"), [])
+        storage.atualizar_status_ticket("T001", "em_andamento")
+        self.assertEqual([(a, n) for a, n, _, _ in self._historico("T001")], [("aberto", "em_andamento")])
 
 
 if __name__ == "__main__":
