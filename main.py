@@ -17,6 +17,9 @@ class TicketInput(BaseModel):
     sintomas: Optional[List[str]] = None
     descricao: Optional[str] = None
     timestamp: Optional[datetime] = None
+    status: str = "aberto"
+    resolvido_em: Optional[datetime] = None
+    encerrado_em: Optional[datetime] = None
 
 
 class CorrelationReasonOutput(BaseModel):
@@ -73,7 +76,10 @@ def create_ticket(ticket_input: TicketInput) -> PostTicketResponse:
         serviço=ticket_input.servico,
         sintomas=ticket_input.sintomas,
         descrição=ticket_input.descricao,
-        timestamp=ticket_input.timestamp
+        timestamp=ticket_input.timestamp,
+        status=ticket_input.status,
+        resolvido_em=ticket_input.resolvido_em,
+        encerrado_em=ticket_input.encerrado_em
     )
 
     if not save_ticket(ticket):
@@ -91,7 +97,7 @@ def create_ticket(ticket_input: TicketInput) -> PostTicketResponse:
             continue
 
         result = correlate(ticket, existing)
-        if result.score >= 60:
+        if result.correlacionado:
             save_correlation(result)
             correlacoes_encontradas += 1
 

@@ -136,6 +136,39 @@ class TestMain(unittest.TestCase):
         self.assertTrue(correlations[0]["correlacionado"])
         self.assertGreater(len(correlations[0]["reasons"]), 0)
 
+    def test_periodos_distintos_nao_geram_correlacao(self):
+        """Tickets semelhantes em períodos distintos não devem ser correlacionados."""
+        payload1 = {
+            "id": "T001",
+            "ativo": "SERVER-01",
+            "servico": "Database",
+            "timestamp": "2026-10-29T10:00:00+00:00",
+            "status": "resolvido",
+            "resolvido_em": "2026-10-29T10:30:00+00:00"
+        }
 
+        payload2 = {
+            "id": "T002",
+            "ativo": "SERVER-01",
+            "servico": "Database",
+            "timestamp": "2026-10-29T11:00:00+00:00",
+            "status": "aberto"
+        }
+
+        response1 = self.client.post("/tickets", json=payload1)
+        self.assertEqual(response1.status_code, 200)
+        self.assertTrue(response1.json()["salvo"])
+
+        response2 = self.client.post("/tickets", json=payload2)
+        self.assertEqual(response2.status_code, 200)
+        self.assertTrue(response2.json()["salvo"])
+        self.assertEqual(response2.json()["correlacoes_encontradas"], 0)
+
+        correlations = self.client.get("/correlations")
+        self.assertEqual(correlations.status_code, 200)
+        self.assertEqual(len(correlations.json()), 0)
+
+
+        
 if __name__ == "__main__":
     unittest.main()
